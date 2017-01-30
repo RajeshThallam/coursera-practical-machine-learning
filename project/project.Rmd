@@ -1,0 +1,270 @@
+---
+title: "Predicting Exercise Manner with Classification Methods"
+output:
+  html_document:
+    theme: united
+    highlight: tango
+---
+
+### Coursera: Practical Machine Learning - Final Project
+#### Rajesh Thallam
+#### 22-Jan-2017
+
+## Background
+
+Majority of the attention in human activity recognition research focuses on discrimination between different type of activities, but not quality of the activities. In this study, the goal is to investigate how well an activity was performed by six wearers of electronic devices. These six participants were between 20 to 28 years with little weight lifting experience. They were asked to perform one set of 10 repetitions of the Unilateral Dumbbell Biceps Curl in five different fashions, namely
+
+- **Class A**: exactly according to the specification
+- **Class B**: throwing the elbows to the front
+- **Class C**: lifting the dumbbell only halfway
+- **Class D**: lowering the dumbbell only half way
+- **Class E**: throwing the hips to the front.
+
+More information about the data and how quality of data was assured is available from the website [here](http://groupware.les.inf.puc-rio.br/har).
+
+## Project Goal
+
+The goal of this project is to predict the manner in which the participants did the exercise. In other words, we need to predict the different fashions of the Unilateral Dumbbell Biceps Curl performed by the participants. It is the `classe` variable in the dataset, and any of the other variables can be used to predict with.
+
+### Data Preparation and Loading R packages  
+
+#### Load packages
+
+Based on the exploratory data analysis, it is clear that a non-linear model is right choice for making predictions. I chose to use regression trees and random forest to demonstrate the predictions. Below chunk loads the required packages
+
+```{r load_packages, message=FALSE}
+## Load necessary packages
+library(knitr)
+library(caret)
+library(randomForest)
+library(rpart)
+knitr::opts_chunk$set(cache=TRUE)
+```
+
+#### Getting Data
+
+Below code chunk downloads the data files if they don’t exist in the `data` directory.
+
+```{r get_data}
+# URL of the training and testing data
+train.url ="https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+test.url = "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+
+# file names
+train.name = "./data/pml-training.csv"
+test.name = "./data/pml-testing.csv"
+
+# if directory does not exist, create new
+if (!file.exists("./data")) {
+  dir.create("./data")
+}
+
+# if files does not exist, download the files
+if (!file.exists(train.name)) {
+  download.file(train.url, destfile=train.name, method="curl")
+}
+
+if (!file.exists(test.name)) {
+  download.file(test.url, destfile=test.name, method="curl")
+}
+```
+
+#### Read data into data frames
+
+```{r load_data}
+# load the CSV files as data.frame 
+train.raw = read.csv("./data/pml-training.csv", na.strings=c("NA", "#DIV/0!", ""), stringsAsFactors = FALSE)
+test.raw  = read.csv("./data/pml-testing.csv" , na.strings=c("NA", "#DIV/0!", ""), stringsAsFactors = FALSE)
+```
+
+The training dataset contains `r dim(train.raw)[2]` variables with `r dim(train.raw)[1]` observations and the test dataset contains `r dim(test.raw)[1]` observations with `r dim(test.raw)[2]` variables to test the performance of prediction of the classification model. Both training and test data sets have same variables except that the training data set has a predictor variable `classe` and test data has an additional field `problem_id` which is a running sequence.
+
+## Data Cleaning
+
+After observing the data and the distinct values for each column in the file, I planned to standardize the data values or types, remove irrelevant columns or columns with missing data that may not help the model.
+
+#### Convert "#DIV/0" strings to NA
+
+```{r data_clean_1}
+index.divbyzero <- sapply(train.raw, function(x) x=="#DIV/0!")
+train.raw[index.divbyzero] <- NA
+
+index.divbyzero <- sapply(test.raw, function(x) x=="#DIV/0!")
+test.raw[index.divbyzero] <- NA
+```
+
+#### Convert categorical variables to factors
+
+```{r data_clean_2}
+# converting predictor variable `classe` as a factor variable
+train.raw$classe <- factor(train.raw$classe)
+```
+
+#### Removing insignificant columns
+
+There are quite a few variables consisting only 0 or NA which will not help in making predictions and hence excluded them from the model. In addition, following variables were removed
+
+- `X`: just a sequence from 1 to 19622
+- `user_name`: names of the participants
+- `timestamp` variables indicating the date/time of when the activity was performed
+There is no seasonality pattern observed in `timestamp` variables and hence may not contribute to the classification.
+
+```{r data_clean_3}
+# set variable with variables to be removed
+insignificant.columns <- c(
+      "kurtosis_yaw_belt", "kurtosis_yaw_dumbbell", "kurtosis_yaw_forearm",
+      "skewness_yaw_belt", "skewness_yaw_dumbbell", "skewness_yaw_forearm",
+      "amplitude_yaw_belt", "amplitude_yaw_dumbbell", "amplitude_yaw_forearm",
+      "X", "user_name", "raw_timestamp_part_1", "raw_timestamp_part_2",
+      "cvtd_timestamp", "new_window")
+```
+
+#### Removing columns with missing data
+
+There are still data columns with missing values (or NA). I excluded these variables as well from the data because these variables will not have enough power to explain their influence on the prediction. In addition, building a model based on variables that are mostly missing is impractical.
+
+```{r data_clean_4}
+
+# find variables with > 95% of values as missing or NA
+max.NA.percent = 5
+max.NA.count <- nrow(train.raw) / 100 * max.NA.percent
+max.NA.columns <- names(which(colSums(is.na(train.raw) | train.raw == "") > max.NA.count))
+```
+
+#### Putting it all together
+
+Create new training and test data sets after removing the previously identified variables from the data set.
+
+```{r data_clean_5}
+remove.train.columns <- names(train.raw) %in% c(insignificant.columns, max.NA.columns)
+train.clean <- train.raw[!remove.train.columns]
+remove.test.columns <- names(test.raw) %in% c(insignificant.columns, max.NA.columns, "problem_id")
+test.clean <- test.raw[!remove.test.columns]
+```
+
+#### Excluding highly correlated variables
+
+Having highly correlated variables in the training data set is just introducing redundancy and increasing computation time. I identified variables with high correlations amongst each other in the training data set. 
+
+```{r data_exploration}
+library(corrplot)
+classe.index <- which(names(train.clean) == "classe")
+correlation.matrix <- cor(train.clean[, -classe.index])
+highly.correlated <- findCorrelation(correlation.matrix, cutoff=0.9, exact=TRUE)
+highly.correlated.columns <- names(train.clean[, highly.correlated])
+corrplot(correlation.matrix, method="square", type="lower", order="hclust", tl.cex=0.60, tl.col="black", tl.srt = 45, diag = FALSE)
+```
+
+There are some features that are quite correlated with each other. I excluded these highly correlated variables from the training and test data sets.
+
+```{r data_clean_6}
+remove.train.columns <- names(train.clean) %in% c(highly.correlated.columns)
+train.clean <- train.clean[!remove.train.columns]
+remove.test.columns <- names(test.clean) %in% c(highly.correlated.columns)
+test.clean <- test.clean[!remove.test.columns]
+```
+
+After data cleansing, the training dataset now contains `r dim(train.clean)[2]` variables with `r dim(train.clean)[1]` observations and the test dataset contains `r dim(test.clean)[1]` observations with `r dim(test.clean)[2]` variables to test the performance of prediction of the classification model.
+
+## Data Partitioning
+
+Since the test data does not have the predictor variable `classe`, performance of the classification model cannot be evalauted. Therefore, training data is split up with 75% as mini training data and the rest as validation data set.
+
+```{r data_partition}
+set.seed(118258)
+partition <- createDataPartition(y=train.clean$classe, p = 0.75, list=FALSE)
+training   <- train.clean[partition, ]
+validation <- train.clean[-partition, ]
+```
+
+## Model Building
+
+I started building a simple regression tree with and without pre-processing of source data. I used `trainControl` with method as `cv` (cross-validation) to generate parameters that further control how models are created.
+
+### Regression Tree
+
+```{r model_regression}
+# setting option for 10-fold CV
+train_control <- trainControl(method="cv", number=10)
+
+# fit the model without pre-processing
+model.fit.1 <- train(classe ~., method="rpart", data=training, trControl = train_control)
+result.1 <- confusionMatrix(validation$classe, predict(model.fit.1, newdata = validation))
+# confusion matrix
+result.1$table
+# statistics
+result.1$overall
+
+# fit the model with preprocessing 
+model.fit.2 <- train(classe ~., method="rpart", preProcess=c("center", "scale"), data = training, trControl = train_control)
+result.2 <- confusionMatrix(validation$classe, predict(model.fit.2, newdata = validation))
+# confusion matrix
+result.2$table
+# statistics
+result.2$overall
+```
+
+The accuracies of the two models using regression tree isn’t good at all. The accuracy is only around `r result.2$overall[1]`, which is not acceptable. Since pre-processing the data didn’t help the performance of regression tree based predictions, I tried next with random forest.
+
+### Random Forest
+
+Random forest requires more computation time, so I chose to find variables that are more likely to predict `classe` well and see how the model performs first. The first random forest model evaluates if classification of data can be done using only highly correlated variables with predictor variable `classe`.
+
+```{r model_random_forest_3}
+# Get correlation matrix and find the variables with high correlation with classe
+k <- training
+k$classe <- as.numeric(training$classe)
+cormatrix <- data.frame(cor(k[,-c(1)]))
+cormatrix$name <- names(k[2:dim(training)[2]])
+t <- data.frame(cbind(abs(cormatrix$classe), cormatrix$classe, cormatrix$name))
+names(t) <- c("abs.cor", "cor", "name")
+
+# show variables with highest correlation with classe
+tail(arrange(t,abs.cor),8)
+
+# try model with variable with highest corr with classe
+model.fit.3 <- randomForest(classe ~ pitch_forearm + magnet_arm_x + magnet_belt_y + magnet_arm_y + accel_arm_x + accel_forearm_x + magnet_belt_z, data=training)
+result.3 <- confusionMatrix(validation$classe, predict(model.fit.3, newdata = validation))
+# confusion matrix
+result.3$table
+# statistics
+result.3$overall
+```
+
+If we predict the classe with the variables that correlates with classe the most (r> 0.1), we get a classification model with accuracy of `r result.3$overall[1]` if we apply it on the testing set. This is fairly good since the prediction only depends on limited number of variables. It's evident random forest tree with just highly correlated variables performed much better than regression trees. Let's see if including all the variables in random variables does any better (runs longer)
+
+```{r model_random_forest_4}
+# try full model with all 
+model.fit.4 <- randomForest(classe ~ ., data = training)
+result.4 <- confusionMatrix(validation$classe, predict(model.fit.4, newdata = validation))
+# confusion matrix
+result.4$table
+# statistics
+result.4$overall
+```
+
+The model considering all of the variables after dimension reduction/data cleaning earlier has a accuracy of `r result.4$overall[1]`, which gets even better. We can further inspect to see which variables or features were important in the random forest model.
+
+```{r model_feature_importance}
+varImpPlot(model.fit.4, cex=0.7, pch=16, main = 'Variable Importance Plot: model.fit.4')
+```
+
+The plot below shows how error rate varies for each class based on number of trees.
+
+```{r model_error_rate}
+plot(model.fit.4, , cex=0.7, main='Error vs No. of trees plot')
+```
+
+## Conclusion
+
+We can conclude that the random forest model with all variables included is a higly predictive model with an estimated out of sample error rate of `r (1 - result.4$overall[1])*100`%. Looking at the model results, we can evaluate that random forest classification technique works better than a regression tree in this case.
+
+## Predicting on test data
+
+Predicting `classe` for 20 test cases using the random forest model with all variables.
+
+```{r predict_for_test}
+results <- as.data.frame(predict(model.fit.4, newdata = test.clean), optional=TRUE)
+```
+
+`NOTE: results not shown intentionally`
